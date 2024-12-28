@@ -1,0 +1,136 @@
+from datetime import datetime, timedelta
+import pandas as pd
+import numpy as np
+import os  
+import logging
+
+
+from airflow import DAG
+from airflow.decorators import task
+from airflow.utils.dates import days_ago
+from airflow.models import Variable
+
+from lib.sql.mysql.mysql_manager import MySQLManager
+from lib.sql.synapse.synapse_manager import SynapseManager
+from lib.azure.azure_manager import AzureManager
+from lib.email.email_manager_v2 import EmailManagerV2
+
+from lib.teams.teams_manager import send_teams
+from lib.email import emails_automate
+
+def executa_mysql(query, sqlManager):
+    result = sqlManager.execute([query])
+    return result
+
+def consulta_mysql(query, sqlManager):
+    result2 = sqlManager.query(query)
+    return result2
+
+# Definindo o DAG
+with DAG(
+    dag_id='Automate_Monitoramento_Erro_Pedidos',
+    description='Monitoramento e aviso de pedidos com erros',
+    start_date=days_ago(1),
+    schedule_interval='*/15 * * * *',
+    catchup=False,
+    tags=['Automate', 'Banco', 'Monitoramento', 'MySql', 'E-mail']
+) as dag:
+
+    @task
+    def busca_erro():
+        sqlmanager = MySQLManager('Key-SQL')
+
+        query_erro = """
+    SELECT NUM_REQUISICAO, COD_LOJA_SAP, TPO_PEDIDO, STATUS
+    FROM automate_pedidos_sap
+    WHERE status = 1
+    AND DATE(DATA_PEDIDO) = CURDATE();
+
+        """
+
+        resultado_query_erro = consulta_mysql(query_erro, sqlmanager)
+        logging.info("DataFrame de Erros:\n%s", resultado_query_erro)
+        
+        # Converte o resultado da consulta para DataFrame e retorna como XCom
+        df_erro = pd.DataFrame(resultado_query_erro)
+        return df_erro
+
+    @task
+    def busca_pedidos_zerados():
+        sqlmanager = MySQLManager('Key-SQL')
+
+        query_pedidos_zerados = """
+        SELECT DISTINCT 
+            aps.NUM_REQUISICAO
+        FROM 
+            automate_pedidos_sap aps
+        LEFT JOIN 
+            automate_pedidos_sap_item apsi
+        ON 
+            aps.NUM_REQUISICAO = apsi.NUM_REQUISICAO
+        WHERE 
+            aps.DATA_PEDIDO >= CURDATE()
+            AND aps.DATA_PEDIDO < CURDATE() + INTERVAL 1 DAY
+            AND apsi.NUM_REQUISICAO IS NULL;
+        """
+
+        resultado_query_zerados = consulta_mysql(query_pedidos_zerados, sqlmanager)
+        logging.info("DataFrame de Pedidos Zerados:\n%s", resultado_query_zerados)
+        
+        # Converte o resultado da consulta para DataFrame e retorna como XCom
+        df_pedidos_zerados = pd.DataFrame(resultado_query_zerados)
+        return df_pedidos_zerados
+
+    @task
+    def send_error_email(**kwargs):
+
+        # Puxa o DataFrame do XCom retornado por busca_erro
+        df_error = kwargs['ti'].xcom_pull(task_ids='busca_erro')
+        # Se o DataFrame estiver vazio, não envia o e-mail e encerra a DAG
+        if df_error.empty:
+            logging.info("Nenhum erro encontrado, finalizando a DAG sem enviar e-mail.")
+            return None  # A DAG será encerrada sem enviar e-mail
+        
+        mail_to = ['terc.romilson.santos@hortifruti.com.br', 'terc.joao.guimaraes@hortifruti.com.br', 'terc.wendrill.ferrei@hortifruti.com.br, terc.emerson@hortifruti.com.br']
+        msg_email = 'Segue em anexo as requisições com status erro no automate'
+        file = 'df_error.xlsx'
+
+        # Instancia o EmailManagerV2 e envia o email com o DataFrame como anexo
+        email = EmailManagerV2()
+        email.send_email(
+            mail_to,
+            'Pedidos com status de erro no Automate',
+            msg_email.replace('\n', '<br>'),
+            attachment_df=df_error,
+            attachment_name=file,
+            attachment_format='xlsx'
+        )
+
+    @task
+    def send_zeroed_orders_email(**kwargs):
+
+        # Puxa o DataFrame do XCom retornado por busca_pedidos_zerados
+        df_zeroed = kwargs['ti'].xcom_pull(task_ids='busca_pedidos_zerados')
+        # Se o DataFrame estiver vazio, não envia o e-mail e encerra a DAG
+        if df_zeroed.empty:
+            logging.info("Nenhum pedido zerado encontrado, finalizando a DAG sem enviar e-mail.")
+            return None  # A DAG será encerrada sem enviar e-mail
+        
+        mail_to = ['terc.romilson.santos@hortifruti.com.br', 'terc.joao.guimaraes@hortifruti.com.br', 'terc.wendrill.ferrei@hortifruti.com.br' , 'terc.emerson@hortifruti.com.br']
+        msg_email = 'Segue em anexo os pedidos zerados encontrados no automate'
+        file = 'df_zeroed_orders.xlsx'
+
+        # Instancia o EmailManagerV2 e envia o email com o DataFrame como anexo
+        email = EmailManagerV2()
+        email.send_email(
+            mail_to,
+            'Pedidos com itens zerados no banco',
+            msg_email.replace('\n', '<br>'),
+            attachment_df=df_zeroed,
+            attachment_name=file,
+            attachment_format='xlsx'
+        )
+
+    # Definindo a sequência das tarefas
+    busca_erro() >> send_error_email()
+    busca_pedidos_zerados() >> send_zeroed_orders_email()
