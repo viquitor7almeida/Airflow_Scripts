@@ -1,0 +1,187 @@
+import requests
+import pandas as pd
+import time
+from datetime import datetime , timedelta
+
+
+
+from airflow import DAG
+from airflow.models import Variable
+from airflow.decorators import task
+from airflow.utils.dates import days_ago
+
+from lib.sql.mysql.mysql_manager import MySQLManager
+
+#função para executar scripts no mysql
+def executa_mysql(query, sqlManager):
+    result = sqlManager.execute([query])
+    return result
+
+def consulta_mysql(query, sqlManager):
+    result2 = sqlManager.query(query)
+    return result2
+
+with DAG(
+    dag_id='Automate_Limpeza_Sap_Item',
+    description='Limpa a Tabela automate_sap_item do banco do Automate(Mysql)',
+    start_date=days_ago(1),
+    schedule_interval='0 05 * * *',
+    catchup=False,
+    tags=['Automate', 'Banco', 'Estoque', 'MySql']
+) as dag:
+    
+    #cria uma nov tabela auxiliar
+    @task
+    def cria_tabela_aux():
+        sqlmanager = MySQLManager('mysql_devops')
+        cria_query = """
+        CREATE TABLE `automate_pedidos_sap_item_aux` (
+  `my_row_id` bigint unsigned NOT NULL AUTO_INCREMENT /*!80023 INVISIBLE */,
+  `NUM_REQUISICAO` varchar(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin DEFAULT NULL,
+  `COD_LOJA_SAP` varchar(4) COLLATE utf8mb4_0900_bin DEFAULT NULL,
+  `COD_PRODUTO` int DEFAULT NULL,
+  `FATOR` float DEFAULT NULL,
+  `ESTOQUE` int DEFAULT NULL,
+  `RECEBIMENTO` int DEFAULT NULL,
+  `PROJETADO` float DEFAULT NULL,
+  `SUGESTAO` int DEFAULT NULL,
+  `PEDIDO_SEM_RESTRICAO` int DEFAULT NULL,
+  `PEDIDO_FINAL` int DEFAULT NULL,
+  `FLG_EXOTICO` int DEFAULT NULL,
+  `FLG_PROMO` int DEFAULT NULL,
+  `FLG_SAFRA` int DEFAULT NULL,
+  `FLG_BANCA` int DEFAULT NULL,
+  `MOTIVO_ALTERACAO` varchar(100) COLLATE utf8mb4_0900_bin DEFAULT NULL,
+  `DESVIO` float DEFAULT NULL,
+  `FLG_RUPTURA` bit(1) DEFAULT b'0',
+  PRIMARY KEY (`my_row_id`)
+)
+ 
+        """
+        executa_mysql(cria_query, sqlmanager)
+     
+    #copia a principal pra a auxiliar    
+    @task
+    def copy_sap_item_to_aux():
+        sqlmanager = MySQLManager('mysql_devops')
+        copy_query = """
+        INSERT INTO
+`automate_pedidos_sap_item_aux` (
+    `NUM_REQUISICAO`,
+    `COD_LOJA_SAP`,
+    `COD_PRODUTO`,
+    `FATOR`,
+    `ESTOQUE`,
+    `RECEBIMENTO`,
+    `PROJETADO`,
+    `SUGESTAO`,
+    `PEDIDO_SEM_RESTRICAO`,
+    `PEDIDO_FINAL`,
+    `FLG_EXOTICO`,
+    `FLG_PROMO`,
+    `FLG_SAFRA`,
+    `FLG_BANCA`,
+    `MOTIVO_ALTERACAO`,
+    `DESVIO`,
+    `FLG_RUPTURA`
+)
+SELECT
+ 
+    `NUM_REQUISICAO`,
+    `COD_LOJA_SAP`,
+    `COD_PRODUTO`,
+    `FATOR`,
+    `ESTOQUE`,
+    `RECEBIMENTO`,
+    `PROJETADO`,
+    `SUGESTAO`,
+    `PEDIDO_SEM_RESTRICAO`,
+    `PEDIDO_FINAL`,
+    `FLG_EXOTICO`,
+    `FLG_PROMO`,
+    `FLG_SAFRA`,
+    `FLG_BANCA`,
+    `MOTIVO_ALTERACAO`,
+    `DESVIO`,
+    `FLG_RUPTURA`
+FROM
+ 
+    `automate_pedidos_sap_item`;
+        
+        """
+        executa_mysql(copy_query, sqlmanager)
+        
+    @task
+    def query_truncate_sap_item():
+        sqlmanager = MySQLManager('mysql_devops')
+        truncate_query = """
+        TRUNCATE TABLE `automate_pedidos_sap_item`;
+        """
+        executa_mysql(truncate_query, sqlmanager)
+     
+    #copia os itens necessários da auxiliar para a sap itens    
+    @task
+    def send_aux_to_sap_item():
+        sqlmanager = MySQLManager('mysql_devops')
+        today = datetime.today().date()
+        ten_days_ago = today - timedelta(days=9)
+        send_query = f"""
+        INSERT INTO `automate_pedidos_sap_item` (
+    `NUM_REQUISICAO`,
+    `COD_LOJA_SAP`,
+    `COD_PRODUTO`,
+    `FATOR`,
+    `ESTOQUE`,
+    `RECEBIMENTO`,
+    `PROJETADO`,
+    `SUGESTAO`,
+    `PEDIDO_SEM_RESTRICAO`,
+    `PEDIDO_FINAL`,
+    `FLG_EXOTICO`,
+    `FLG_PROMO`,
+    `FLG_SAFRA`,
+    `FLG_BANCA`,
+    `MOTIVO_ALTERACAO`,
+    `DESVIO`,
+    `FLG_RUPTURA`
+)
+SELECT
+    aux.`NUM_REQUISICAO`,
+    aux.`COD_LOJA_SAP`,
+    aux.`COD_PRODUTO`,
+    aux.`FATOR`,
+    aux.`ESTOQUE`,
+    aux.`RECEBIMENTO`,
+    aux.`PROJETADO`,
+    aux.`SUGESTAO`,
+    aux.`PEDIDO_SEM_RESTRICAO`,
+    aux.`PEDIDO_FINAL`,
+    aux.`FLG_EXOTICO`,
+    aux.`FLG_PROMO`,
+    aux.`FLG_SAFRA`,
+    aux.`FLG_BANCA`,
+    aux.`MOTIVO_ALTERACAO`,
+    aux.`DESVIO`,
+    aux.`FLG_RUPTURA`
+FROM
+    `automate_pedidos_sap_item_aux` AS aux
+JOIN
+    `automate_pedidos_sap` AS sap
+ON
+    sap.NUM_REQUISICAO  = aux.NUM_REQUISICAO
+WHERE
+    sap.DATA_PEDIDO > '{ten_days_ago}';  
+        
+        """
+        executa_mysql(send_query, sqlmanager)
+        
+    #query de truncate da auxiliar
+    @task
+    def query_apaga_aux():
+        sqlmanager = MySQLManager('mysql_devops')
+        apaga_query = """
+        DROP TABLE automate_pedidos_sap_item_aux
+        """
+        executa_mysql(apaga_query, sqlmanager)
+
+    cria_tabela_aux() >> copy_sap_item_to_aux() >> query_truncate_sap_item() >> send_aux_to_sap_item() >> query_apaga_aux()
