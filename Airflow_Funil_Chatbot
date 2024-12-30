@@ -1,0 +1,263 @@
+from datetime import datetime, timedelta
+import pandas as pd
+import numpy as np
+import os
+
+from airflow import DAG
+from airflow.decorators import task
+from airflow.utils.dates import days_ago
+from airflow.models import Variable
+
+from lib.sql.mysql.mysql_manager import MySQLManager
+from lib.sql.synapse.synapse_manager import SynapseManager
+from lib.teams.teams_manager import send_teams
+from lib.azure.azure_manager import AzureManager
+
+from google.oauth2 import service_account
+
+bq_auth_nt = service_account.Credentials.from_service_account_file('*')
+bq_auth_hf = service_account.Credentials.from_service_account_file('*')
+
+init = pd.Timestamp.today()+timedelta(days=-7)
+init = init.strftime("%Y-%m-%d")
+
+def executa_mysql(query, mysqlManager):
+    result = mysqlManager.execute([query])
+    return result
+
+def consulta_synapse(query, synapseManager):
+    df = synapseManager.query(query)
+    return df
+
+def consulta_mysql(query, sqlManager):
+    df = sqlManager.query(query)
+    return df
+
+def get_bq_session_data(init, bandeira):
+    print(f'Extraindo dados Botmaker BQ {bandeira}', datetime.today())
+
+
+    if bandeira == 'NATURAL DA TERRA':
+        tabela = 'ext_metric_naturaldaterra'
+        auth = bq_auth_nt
+    elif bandeira == 'HORTIFRUTI':
+        tabela = 'ext_metric_hortifruti'
+        auth = bq_auth_hf
+
+    query_bq = f'''
+        SELECT SM.session_id
+                ,SM.session_creation_time
+                ,SM.starting_cause
+                ,SM.user_platform_contact_id
+                ,(SELECT value FROM UNNEST(starting_cause_info) WHERE name = 'name') as starting_cause_info_name
+                ,MM.creation_time
+                ,MM.msg_from
+                ,MM.message_type
+                ,MM.message
+        FROM `botmaker-bigdata.{tabela}.session_metrics` SM
+        JOIN `botmaker-bigdata.{tabela}.message_metrics` MM ON SM.session_id=MM.session_id
+        WHERE 1=1
+        AND SM.user_platform_contact_id NOT LIKE '%naturaldaterra_test_chat%'
+        AND SM.user_platform_contact_id NOT LIKE '%75748231%'
+        AND SM.user_platform_contact_id NOT LIKE '%98598409%'
+        AND SM.user_platform_contact_id NOT LIKE '%96363636%'
+        AND SM.user_platform_contact_id NOT LIKE '%71601139%'
+        AND SM.session_creation_time >= '{init}'
+        AND MM.session_creation_time >= '{init}'
+    '''
+
+    print(query_bq)
+    #Realiza a consulta se autenticando no BQ da botmaker
+    df = pd.read_gbq(query=query_bq, credentials=auth, project_id='botmaker-bigdata')
+    print('pd.read_gbq')
+
+    print(df)
+    return df
+
+
+def mapeamento_funil(df_input, eventos, bandeira):
+    df = df_input.copy()
+    for key in eventos:
+        df[key] = np.where(df['message'].str.contains('|'.join(eventos[key]),na=False),1,0)
+
+    df_final = df[['session_id','session_creation_time','user_platform_contact_id','starting_cause','starting_cause_info_name',
+                'iniciou_pedido','montou_a_lista','fechou_a_lista','carrinho_criado','pedido_confirmado','acionou_o_sac',
+                'lista_de_transmissao','regiao_invalida','campanha_email','campanha_stories']]
+##,'selecao_pedido']]
+
+    #adicionar a coluna da lista do df
+    df_final['starting_cause_info_name'].fillna('NA',inplace=True)
+
+    df_final = df_final.groupby(['session_id','session_creation_time'
+                                ,'user_platform_contact_id','starting_cause','starting_cause_info_name']).sum().reset_index()
+    for key in eventos:
+        df_final[key] = np.where(df_final[key]>=1,1,0)
+
+    #Adiciona quantidade de mensagens da sessao
+    #df_tamanho = df.groupby('session_id')['session_id'].value_counts().reset_index()
+    df_tamanho = df.groupby(['session_id'], sort=False).size().reset_index(name='Count')
+    df_final = df_final.merge(df_tamanho,on='session_id',how='left')
+    df_final = df_final.rename(columns={'Count':'tamanho_conversa'})
+
+    #Filtra sessões erradas
+    df_estranho = df_final.copy()
+    df_estranho['qtd'] = df_estranho['iniciou_pedido'] + df_estranho['montou_a_lista'] + df_estranho['fechou_a_lista'] + df_estranho['carrinho_criado'] + df_estranho['pedido_confirmado']
+    df_estranho = df_estranho.loc[(df_estranho['iniciou_pedido']==0) & (df_estranho['qtd']>0)]
+
+    print(df_final)
+    print(df_estranho)
+    print(df_tamanho)
+    print(df_input)
+
+    df_final = df_final.loc[df_final['iniciou_pedido']==1]
+    df_final['bandeira'] = bandeira
+    return df_final,df_estranho
+
+
+with DAG(
+    'Forecast_Funil_Chatbot',
+    start_date=days_ago(1),
+    schedule_interval='@hourly',
+    catchup=False,
+    tags=['funil', 'chatbot','forecast'],
+) as dag:
+
+
+
+#Insert de dados na tabela do mysql que o metabase Le
+    @task
+    def inserir_sessoes(**kwargs):
+        mysqlmanager = MySQLManager('query_damasco')
+
+        delete = True
+        df_hf = kwargs['ti'].xcom_pull(key='df_hf')
+        df_nt = kwargs['ti'].xcom_pull(key='df_nt')
+        init = kwargs['ti'].xcom_pull(key='init')
+
+        df_funil_final = pd.concat([df_nt,df_hf])
+
+        table = 'CHATBOT_FUNIL'
+        insert_sessoes = f'INSERT INTO {table} ({",".join([col for col in df_funil_final.columns])}) VALUES '
+        batch = ", ".join((f"""('{str(row['session_id'])}'
+                            ,'{str(row['session_creation_time'])}'
+                            ,'{str(row['user_platform_contact_id'])}'
+                            ,'{str(row['starting_cause'])}'
+                            ,'{str(row['starting_cause_info_name'])}'
+                            ,'{float(row['iniciou_pedido'])}'
+                            ,'{float(row['montou_a_lista'])}'
+                            ,'{float(row['fechou_a_lista'])}'
+                            ,'{float(row['carrinho_criado'])}'
+                            ,'{float(row['pedido_confirmado'])}'
+                            ,'{float(row['acionou_o_sac'])}'
+                            ,'{float(row['lista_de_transmissao'])}'
+                            ,'{float(row['regiao_invalida'])}'
+                            ,'{float(row['campanha_email'])}'
+                            ,'{float(row['campanha_stories'])}'
+                            ,'{float(row['tamanho_conversa'])}'
+                            ,'{str(row['bandeira'])}'
+                            )""" for _, row in df_funil_final.iterrows()))
+        
+         #,{str(row['selecao_pedido'])}'
+
+
+        #adicionar a nova coluna para o insert
+        print(batch)
+        if(delete):
+            print(f'Deletando {table} e inserindo novos dados')
+            insert_batch = [f'''DELETE FROM {table} WHERE session_creation_time >= '{init}' ''', insert_sessoes + batch]
+            print(insert_batch)
+            mysqlmanager.execute(insert_batch)
+            print('Delete bem sucedido!')
+
+        else:
+            print(f'Inserindo novos dados em {table}')
+            insert_batch = [insert_sessoes + batch]
+            print(insert_batch)
+            mysqlmanager.execute(insert_batch)
+            print('Insert concluído!')
+
+    @task
+    def definir_parametros(**kwargs):
+
+        eventos = {'iniciou_pedido':[
+                             'Preciso de algumas informações para seguir com seu pedido'
+                             ,'button":"Fazer pedido'
+                             ,'Para começar, envie sua listinha de compras'
+                            ]
+            ,'montou_a_lista':['Se quiser adicionar mais itens ao seu carrinho'
+                              ,'Se quiser adicionar mais itens ao carrinho'
+                              ,'A lista foi salva.'
+                              ,'Ótimo! A lista foi confirmada.'
+                              ,'Obrigado! A lista foi confirmada'
+                              ,'A lista foi confirmada'
+                              ,'Clique em "Fechar lista" para']
+            ,'fechou_a_lista':['button":"Fechar lista']
+            ,'carrinho_criado':['Seu carrinho está montado!'
+                               ,'Acesse o link abaixo para confirmar os itens escolhidos'
+                               ,'Falta pouco para concluir o seu pedido!'
+                              ]
+            ,'pedido_confirmado':['Tudo certo! O seu pedido está confirmado!']
+            ,'acionou_o_sac':['Estou te transferindo para o nosso time de atendimento']
+            ,'lista_de_transmissao':['Estou comprando através da lista de transmissão'
+                                    ,'Estou vindo através da lista de transmissão'
+                                    ,'Olá! Estou vindo atravé3s da lista de transmissão'
+                                    ,'Olá, vim pela Lista de Transmissão'
+                                   ]
+            ,'regiao_invalida':['Me desculpe, mas infelizmente ainda não atendemos nessa região']
+            ,'campanha_email':['Olá, vim pela comunicação de Email']
+            ,'campanha_stories':['Olá, vim pelos Stories no Instagram']
+}
+        
+        #Criar um novo item no dicionário direcionado (mensagem)...
+
+        print('Executando Pipeline Funil Chatbot',datetime.today())
+        init = pd.Timestamp.today()+timedelta(days=-7)
+        init = init.strftime("%Y-%m-%d")
+        print(f'Recorte dos dados de sessao a partir do dia {init}')
+
+
+        kwargs['ti'].xcom_push(key='init', value=init)
+        kwargs['ti'].xcom_push(key='eventos', value=eventos)
+
+        # df_nt = get_bq_session_data(init, bandeira='NATURAL DA TERRA')
+        # df_nt, df_estranho_nt = mapeamento_funil(df_nt,eventos,bandeira='NATURAL DA TERRA')
+
+        # df_hf = get_bq_session_data(init, bandeira='HORTIFRUTI')
+        # df_hf, df_estranho_hf = mapeamento_funil(df_hf, eventos, bandeira='HORTIFRUTI')
+
+        # df_funil_final = pd.concat([df_nt,df_hf])
+
+        # print('Inserindo dados na base',datetime.today())
+        # inserir_sessoes(df_funil_final,delete=True,init=init)
+
+        # print('Finalizado a insercao de dados na base',datetime.today())
+
+    @task
+    def gerar_df_nt(**kwargs):
+
+        init = kwargs['ti'].xcom_pull(key='init')
+        eventos = kwargs['ti'].xcom_pull(key='eventos')
+
+        df_nt = get_bq_session_data(init, bandeira='NATURAL DA TERRA')
+        df_nt, df_estranho_nt = mapeamento_funil(df_nt, eventos, bandeira='NATURAL DA TERRA')
+
+        # kwargs['ti'].xcom_push(key='df_nt', value=df_nt)
+
+        kwargs['ti'].xcom_push(key='df_nt', value=df_nt)
+        kwargs['ti'].xcom_push(key='df_estranho_nt', value=df_estranho_nt)
+
+    @task
+    def gerar_df_hf(**kwargs):
+
+        init = kwargs['ti'].xcom_pull(key='init')
+        eventos = kwargs['ti'].xcom_pull(key='eventos')
+
+        df_hf = get_bq_session_data(init, bandeira='HORTIFRUTI')
+        df_hf, df_estranho_hf = mapeamento_funil(df_hf, eventos, bandeira='HORTIFRUTI')
+
+        # kwargs['ti'].xcom_push(key='df_nt', value=df_nt)
+
+        kwargs['ti'].xcom_push(key='df_hf', value=df_hf)
+        kwargs['ti'].xcom_push(key='df_estranho_hf', value=df_estranho_hf)
+
+    definir_parametros() >> [gerar_df_nt() , gerar_df_hf()] >> inserir_sessoes()
