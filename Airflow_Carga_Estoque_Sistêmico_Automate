@@ -1,0 +1,158 @@
+from datetime import datetime, timedelta
+import pandas as pd
+import numpy as np
+
+from airflow import DAG
+from airflow.decorators import task
+from airflow.utils.dates import days_ago
+from airflow.models import Variable
+
+from lib.sql.mysql.mysql_manager import MySQLManager
+from lib.sql.synapse.synapse_manager import SynapseManager
+from lib.teams.teams_manager import send_teams
+
+TEAMS_HOOK = Variable.get('teams_connector_automate')
+AUTOMATE_BLOB_CONTAINER = Variable.get('automate_blob_container')
+
+def executa_mysql(query, sqlManager):
+    result = sqlManager.execute([query])
+    return result
+
+def consulta_synapse(query, synapseManager):
+    df = synapseManager.query(query)
+    return df
+
+def consulta_mysql(query, sqlManager):
+    df = sqlManager.query(query)
+    return df
+
+with DAG(
+    'Automate_Carga_Estoque_Sistemico',
+    start_date=days_ago(1),
+    schedule_interval='30 13 * * *',
+    catchup=False,
+    tags=['Automate', 'Carga', 'Estoque', 'Sistemico'],
+) as dag:
+
+    @task
+    def consulta_sku(**kwargs):
+        sqlmanager = MySQLManager('MySQL_Cloud')
+
+        today = pd.Timestamp('today').strftime('%Y%m%d')
+        hora = int(pd.Timestamp('now').strftime('%H'))
+        print(pd.Timestamp('today'))
+
+        skus_query = 'SELECT DISTINCT COD_PRODUTO FROM AUTOMATE_PRODUTOS'
+        skus_automate = consulta_mysql(skus_query, sqlmanager)['COD_PRODUTO'].unique()
+        print(skus_automate.shape)
+        
+        kwargs['ti'].xcom_push(key='today', value=today)
+        kwargs['ti'].xcom_push(key='hora', value=hora)
+        kwargs['ti'].xcom_push(key='skus_automate', value=skus_automate.tolist())
+
+    @task
+    def consulta_banco(**kwargs):
+        try:
+            # Recupera os dados do XCom
+            ti = kwargs['ti']
+            skus_automate = ti.xcom_pull(key='skus_automate')
+            today = ti.xcom_pull(key='today')
+            hora = ti.xcom_pull(key='hora') 
+
+
+            if hora > 8:
+                print('Carga da tarde')
+                synapseManager = SynapseManager('synapse')
+                query_estoque_tarde = (f'''
+                    SELECT 
+                        SK_DAT_ESTOQUE_INICIAL as DATA,
+                        l.COD_LOJA_SAP,
+                        p.COD_PRODUTO,
+                        QTD_ESTOQUE
+                    FROM [3_REF].[FATO_POSICAO_ESTOQUE] e
+                    JOIN [3_REF].[DIM_LOJA] l on l.SK_LOJA = e.SK_LOJA
+                    JOIN [3_REF].[DIM_PRODUTO_HIERQ_MERCADOLOGICA] p on p.SK_PRODUTO = e.SK_PRODUTO
+                    WHERE 
+                        SK_DAT_ESTOQUE_INICIAL = '{today}'
+                        AND l.FLG_LOJA = 1
+                        AND l.NOM_STATUS = 'ABERTA'
+                        AND p.NOM_DEPARTAMENTO = 'FLV'
+                        AND p.COD_PRODUTO in {tuple(skus_automate)}
+                    ORDER BY COD_LOJA_SAP asc, COD_PRODUTO asc, QTD_ESTOQUE desc
+                ''')
+
+                df = consulta_synapse(query_estoque_tarde, synapseManager)
+                df['DATA'] = pd.to_datetime(df['DATA'], format='%Y%m%d').astype(str)
+                df.drop_duplicates(['COD_LOJA_SAP', 'COD_PRODUTO'], keep='first', inplace=True)
+                print(df.head())
+
+                kwargs['ti'].xcom_push(key='df', value=df.to_dict(orient='records'))
+
+                sqlmanager = MySQLManager('MySQL_Cloud')
+                sql_insert = f'''INSERT INTO AUTOMATE_ESTOQUE_SISTEMICO (COD_LOJA_SAP,COD_PRODUTO,DATA,QTD_ESTOQUE) VALUES ''' 
+                
+                batch = ", ".join((f"""('{row['COD_LOJA_SAP']}',{row['COD_PRODUTO']},'{row['DATA']}',{row['QTD_ESTOQUE']})""" for row in df.to_dict(orient='records')))
+
+                sql_insert += batch   
+                
+                query_delete ='DELETE FROM AUTOMATE_ESTOQUE_SISTEMICO'
+                executa_mysql(query_delete, sqlmanager)
+                executa_mysql(sql_insert, sqlmanager)
+
+                msgif=("Estoque sistêmico atualizado com sucesso.")
+                send_teams(msgif, TEAMS_HOOK)
+
+            #esse else não será usado no dia a dia, apenas caso a carga precise ser forçada na madrugada.
+
+            else:
+                print('Carga da madrugada')
+                synapseManager = SynapseManager('synapse')
+                data = pd.Timestamp('today').strftime('%Y-%m-%d')
+                query_estoque_madrugada = (f'''
+                    SELECT 
+                        [DATA], 
+                        [CENTRO] as COD_LOJA_SAP, 
+                        [ITEM] as COD_PRODUTO, 
+                        [ESTOQUE] as QTD_ESTOQUE
+                    FROM [1_RAW].[TBL_RAW_FILE_SAP_ESTOQUE] e
+                    JOIN [3_REF].[DIM_LOJA] l on l.COD_LOJA_SAP = e.CENTRO
+                    WHERE DATA = '{data}'
+                        AND l.FLG_LOJA = 1
+                        AND l.NOM_STATUS = 'ABERTA'
+                        AND ITEM in {tuple(skus_automate)}
+                    ORDER BY CENTRO asc, ITEM asc, ESTOQUE desc
+                ''')
+
+                df = consulta_synapse(query_estoque_madrugada, synapseManager)
+                df['COD_PRODUTO'] = df['COD_PRODUTO'].astype(int)
+                df.drop_duplicates(['COD_LOJA_SAP', 'COD_PRODUTO'], keep='first', inplace=True)
+                df['QTD_ESTOQUE'] = df['QTD_ESTOQUE'].str.strip().str.replace(',', '.')
+                df['QTD_ESTOQUE'] = np.where(df['QTD_ESTOQUE'].str.endswith('-'), '-' + df['QTD_ESTOQUE'].str.replace('-', ''), df['QTD_ESTOQUE'])
+                df['QTD_ESTOQUE'] = df['QTD_ESTOQUE'].apply(function.ajuste_numeros_sap).astype(float)
+                print(df.head())
+                
+                kwargs['ti'].xcom_push(key='df', value=df.to_dict(orient='records'))
+
+                sqlmanager = MySQLManager('MySQL_Cloud')
+                sql_insert = f'''INSERT INTO AUTOMATE_ESTOQUE_SISTEMICO (COD_LOJA_SAP,COD_PRODUTO,DATA,QTD_ESTOQUE) VALUES ''' 
+                2
+                batch = ", ".join((f"""('{row['COD_LOJA_SAP']}',{row['COD_PRODUTO']},'{row['DATA']}',{row['QTD_ESTOQUE']})""" for row in df.to_dict(orient='records')))
+
+                sql_insert += batch   
+                
+                query_delete = 'DELETE FROM AUTOMATE_ESTOQUE_SISTEMICO'
+                executa_mysql(query_delete, sqlmanager)
+                executa_mysql(sql_insert, sqlmanager)
+
+                msgelse=("Estoque sistêmico atualizado com sucesso.")
+                send_teams(msgelse, TEAMS_HOOK)
+
+ 
+        except Exception as e:
+            print('Ocorreu um erro durante a execução.')
+            print('Erro: {e}')
+            
+            msgerro=("Erro na atualização do estoque sistêmico: {e}")
+            send_teams(msgerro, TEAMS_HOOK)
+
+    consulta_sku() >> consulta_banco()
